@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"log"
 	"os"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,10 +30,31 @@ type PercentileValues struct {
 	Max         float32
 }
 
-var PERCENTILES = [...]int{0, 10, 50, 90, 99, 100}
+type LineMatch struct {
+	Line string
+	Verb string
+}
+
+const ChanSize = 10000
+const BuffSize = 1000 * 1000
+
+var PERCENTILES = [...]int{10, 50, 90, 99, 100}
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
 func main() {
-	arg := os.Args[1:]
+	argOffset := 1
+	flag.Parse()
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+		argOffset++
+	}
+
+	arg := os.Args[argOffset:]
 
 	f := func(c rune) bool {
 		return c == ','
@@ -42,34 +65,46 @@ func main() {
 	}
 
 	log.Printf("%s, looking for verbs:%v", arg[1], verbs.Verbs)
-	values := filterValues(arg[1], verbs)
+	c := make(chan LineMatch, ChanSize)
+	go filterValues(arg[1], verbs, c)
+	values := processLines(c)
 	percentiles := computePercentiles(values, PERCENTILES[:])
 
 	printPercentiles(percentiles)
 }
 
-func filterValues(filename string, verbs Verbs) AggregatedValues {
+func filterValues(filename string, verbs Verbs, channel chan LineMatch) {
 
 	f, _ := os.Open(filename)
 	defer f.Close()
+	buff := make([]byte, BuffSize)
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(buff, len(buff))
 
-	values := AggregatedValues{
-		Values: make([]float32, 0),
-		Counts: make(map[string]int),
-	}
 	for scanner.Scan() {
 		line := scanner.Text()
 		for _, verb := range verbs.Verbs {
 			if strings.Contains(line, verb) {
-				processLine(line, verb, &values)
+				channel <- LineMatch{line, verb}
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("error reading file: %s, err:%v", filename, err)
 	}
+	close(channel)
+}
 
+func processLines(channel chan LineMatch) AggregatedValues {
+
+	values := AggregatedValues{
+		Values: make([]float32, 0),
+		Counts: make(map[string]int),
+	}
+
+	for lineMatch := range channel {
+		processLine(lineMatch.Line, lineMatch.Verb, &values)
+	}
 	return values
 }
 
