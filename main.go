@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"runtime/pprof"
 	"sort"
@@ -35,8 +38,11 @@ type LineMatch struct {
 	Verb string
 }
 
-const ChanSize = 10000
+const ChanSize = 10 * 1000
 const BuffSize = 1000 * 1000
+const DateFieldIndex = 3
+const TimeFieldIndex = 4
+const ElasticSearchUrl = "http://localhost:9200/frontend3/log/"
 
 var PERCENTILES = [...]int{10, 50, 90, 99, 100}
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
@@ -60,14 +66,14 @@ func main() {
 		return c == ','
 	}
 
-	verbs := Verbs{
-		Verbs: strings.FieldsFunc(arg[0], f),
-	}
+	filename := arg[1]
+	verbs := Verbs{Verbs: strings.FieldsFunc(arg[0], f)}
+	regionId := arg[2]
 
-	log.Printf("%s, looking for verbs:%v", arg[1], verbs.Verbs)
+	log.Printf("%s, looking for verbs:%v, regionId: %v", filename, verbs.Verbs, regionId)
 	c := make(chan LineMatch, ChanSize)
-	go filterValues(arg[1], verbs, c)
-	values := processLines(c)
+	go filterValues(filename, verbs, c)
+	values := processLines(c, regionId)
 	percentiles := computePercentiles(values, PERCENTILES[:])
 
 	printPercentiles(percentiles)
@@ -95,7 +101,7 @@ func filterValues(filename string, verbs Verbs, channel chan LineMatch) {
 	close(channel)
 }
 
-func processLines(channel chan LineMatch) AggregatedValues {
+func processLines(channel chan LineMatch, regionId string) AggregatedValues {
 
 	values := AggregatedValues{
 		Values: make([]float32, 0),
@@ -103,16 +109,16 @@ func processLines(channel chan LineMatch) AggregatedValues {
 	}
 
 	for lineMatch := range channel {
-		processLine(lineMatch.Line, lineMatch.Verb, &values)
+		processLine(regionId, lineMatch.Line, lineMatch.Verb, &values)
 	}
 	return values
 }
 
 // extract a float from the last field in this line
-func processLine(line string, verb string, values *AggregatedValues) {
+func processLine(regionId, line, verb string, values *AggregatedValues) {
 	// TODO: allow for regexp to find the float
-	lastSpace := strings.LastIndexByte(line, ' ')
-	floatStr := line[lastSpace+1:]
+	fields := strings.Fields(line)
+	floatStr := fields[len(fields)-1]
 	f, err := strconv.ParseFloat(floatStr, 32)
 	if err != nil {
 		log.Printf("no float:%s, err: %v", floatStr, err)
@@ -127,6 +133,40 @@ func processLine(line string, verb string, values *AggregatedValues) {
 	} else {
 		values.Counts[verb]++
 	}
+
+	// TODO: filter date+time files in a generic way
+	reading := LatencyReading{
+		DateTimeStr: fields[DateFieldIndex] + "T" + fields[TimeFieldIndex],
+		Latency:     val,
+		Verb:        strings.Replace(verb, "/", "_", -1),
+		RegionID:    regionId,
+	}
+
+	postReading(reading)
+}
+
+type LatencyReading struct {
+	Latency     float32
+	Verb        string
+	DateTimeStr string
+	RegionID    string
+}
+
+func postReading(reading LatencyReading) {
+	buf, err := json.Marshal(reading)
+	if err != nil {
+		log.Printf("failed on json.Marshal: %v, %v", reading, err)
+		return
+	}
+	req, err := http.NewRequest("POST", ElasticSearchUrl, bytes.NewBuffer(buf))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 201 {
+		log.Panicf("req: %v, err: %v, resp: %v", reading, err, resp)
+	}
+	defer resp.Body.Close()
 }
 
 func computePercentiles(values AggregatedValues, percentiles []int) PercentileValues {
@@ -150,11 +190,15 @@ func computePercentiles(values AggregatedValues, percentiles []int) PercentileVa
 	count := len(values.Values)
 	result := PercentileValues{
 		Percentiles: make(map[int]float32, len(percentiles)),
-		Average:     values.Accum / float32(count),
-		Min:         values.Values[0],
-		Max:         values.Values[count-1],
-		Count:       count,
 	}
+	if count == 0 {
+		return result
+	}
+
+	result.Average = values.Accum / float32(count)
+	result.Min = values.Values[0]
+	result.Max = values.Values[count-1]
+	result.Count = count
 
 	for _, percent := range percentiles {
 		result.Percentiles[percent] = f(values.Values, percent)
